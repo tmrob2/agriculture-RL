@@ -7,10 +7,11 @@ import pcse
 import os
 import datetime
 import yaml
-from pcse.fileinput import YAMLCropDataProvider, CABOFileReader
+from pcse.fileinput import YAMLCropDataProvider, CABOFileReader, YAMLAgroManagementReader
 from pcse.util import WOFOST72SiteDataProvider
 
-DATA_DIR = os.path.join(os.getcwd(), 'farm_gym/envs/env_data/')
+#DATA_DIR = os.path.join(os.getcwd(), 'farm_gym/envs/env_data/')
+DATA_DIR = "/home/tmrob2/PycharmProjects/farming-gym/farm_gym/envs/env_data/"
 
 class IrrigationEnv(gym.Env):
     """An environment for OpenAI gym to study crop irrigation"""
@@ -25,7 +26,7 @@ class IrrigationEnv(gym.Env):
         beta=10, 
         seed=0, 
     ):
-        self.action_space = gym.spaces.Discrete(6)
+        self.action_space = gym.spaces.Discrete(9)
         # The observation space is 11 for the model output, and 7 (days) * 5 (weather metric observations / day)
         self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(11 + 7 * 5,), dtype=np.float32)
 
@@ -47,17 +48,23 @@ class IrrigationEnv(gym.Env):
         self.fixed_year = datetime.datetime.strptime(fixed_date, "%Y-%m-%d")
         self.train_weather_data = self._get_train_weather_data()
         self.agromanagement, self.crop_start_date, self.crop_end_date = self._load_agromanagement_data()
+        # Input the baseline agromanagement
+        agro_dir = os.path.join(DATA_DIR, "agro/")
+        agromanagement_file = os.path.join(agro_dir, 'baseline_4yr_model.yaml')
+        self.baseline_agromanagement = YAMLAgroManagementReader(agromanagement_file)
         self.date = self.crop_start_date
-        # The LINTUL engine (Light Interception and Utilisation) simple general crop model
-        # simulating dry matter production as the result of light interception and utilisation
-        # with a constant light use efficiency
-        #
-        # LINTUL3 simulated crop growth under water-limited and nitrogen-limited conditions
-
-        self.model = pcse.models.Wofost72_WLP_FD(self.parameterprovider, self.weatherdataprovider,
-                                         self.agromanagement)
-        self.baseline_model = pcse.models.Wofost72_WLP_FD(self.parameterprovider, self.weatherdataprovider,
-                                                  self.agromanagement)
+        self.isplanted = True if self.crop_start_date is not None else False
+        self.crop_planted = {}
+        self.model = pcse.models.Wofost72_WLP_FD(
+            self.parameterprovider,
+            self.weatherdataprovider,
+            self.agromanagement
+        )
+        self.baseline_model = pcse.models.Wofost72_WLP_FD(
+            self.parameterprovider,
+            self.weatherdataprovider,
+            self.baseline_agromanagement
+        )
         self.log = self._init_log()
 
     def step(self, action):
@@ -103,7 +110,6 @@ class IrrigationEnv(gym.Env):
 
         growth = output['TAGP'][-1] - output['TAGP'][-1-self.intervention_interval]
         growth = growth if not np.isnan(growth) else 0
-        twso = output['TWSO'][-1]
         baseline_growth = baseline_output['TAGP'][-1]\
             - baseline_output['TAGP'][-1-self.intervention_interval]
         baseline_growth = baseline_growth if not np.isnan(baseline_growth) else 0
@@ -113,7 +119,7 @@ class IrrigationEnv(gym.Env):
 
         self._log(growth, baseline_growth, irrigation_amount, reward)
 
-        info = {**output.to_dict(), **self.log}
+        info = {**output.to_dict(), **self.log, **self.crop_planted}
 
         return observation, reward, done, info
 
@@ -147,9 +153,9 @@ class IrrigationEnv(gym.Env):
         old_date = next(iter(dict_.keys()))
         new_date = old_date.replace(year=self.fixed_year.year + 1)
         content = dict_[old_date]
-        crop_start_date = content['CropCalendar']['crop_start_date'].replace(year=self.fixed_year.year+1)
+        crop_start_date = content['CropCalendar']['crop_start_date'] #.replace(year=self.fixed_year.year+1)
         content['CropCalendar']['crop_start_date'] = crop_start_date
-        crop_end_date = content['CropCalendar']['crop_end_date'].replace(year=self.fixed_year.year+1)
+        crop_end_date = content['CropCalendar']['crop_end_date'] #.replace(year=self.fixed_year.year+1)
         content['CropCalendar']['crop_end_date'] = crop_end_date
         dict_[new_date] = dict_.pop(old_date)
         return agromanagement, crop_start_date, crop_end_date
@@ -176,9 +182,56 @@ class IrrigationEnv(gym.Env):
         """
         Apply some irrigation to the crop. The irrigation model can be  {4, 8, 12, 16, 20} 
         cm h of irrigation
+        actions:
+        {0} - do nothing
+        {1, 2, 3} - wheat, maize, 
+        if self.isplanted then planting a crop will do nothing i.e. equivalent of 0
+        {3, 4, 5, 6, 7} - irrigate [4, 8, 12, 16, 20] cm of water
+        {8} - finish crop (harvest)
+
         """
-        amount = action*self.amount # in cm
-        self.model._send_signal(signal=pcse.signals.irrigate, amount=amount, efficiency=0.7)
+        amount = 0
+        if action == 1:
+            # plant wheat
+            if not self.isplanted:
+                self.model._send_signal(
+                    signal=pcse.signals.crop_start, 
+                    day=self.date, 
+                    crop_name='wheat', 
+                    variety_name='Winter_wheat_101',
+                    crop_start_type='sowing',
+                    crop_end_type='harvest'
+                )
+                self.crop_planted[self.date] = 'wheat'
+                self.isplanted = True
+        elif action == 2:
+            # plant maize
+            if not self.isplanted:
+                self.model._send_signal(
+                    signal=pcse.signals.crop_start, 
+                    day=self.date, 
+                    crop_name='maize', 
+                    variety_name='Maize_VanHeemst_1988',
+                    crop_start_type='sowing',
+                    crop_end_type='harvest'
+                )
+                self.crop_planted[self.date] = 'maize'
+                self.isplanted = True
+        elif action in list(range(3, 8)):
+            # irrigate
+            irrigation_rate = (action - 2)
+            amount = irrigation_rate*self.amount # in cm
+            self.model._send_signal(signal=pcse.signals.irrigate, amount=amount, efficiency=0.7)
+        elif action == 8:
+            # harvest
+            if self.isplanted:
+                self.model._send_signal(
+                    signal=pcse.signals.crop_finish,
+                    day=self.date,
+                    finish_type='harvest',
+                    crop_delete=True
+                )
+                self.isplanted = False
         return amount
 
     def reset(self):
@@ -196,7 +249,7 @@ class IrrigationEnv(gym.Env):
         self.model = pcse.models.Wofost72_WLP_FD(self.parameterprovider, self.weatherdataprovider,
                                          self.agromanagement)
         self.baseline_model = pcse.models.Wofost72_WLP_FD(self.parameterprovider, self.weatherdataprovider,
-                                                  self.agromanagement)
+                                                  self.baseline_agromanagement)
         output = self._run_simulation(self.model)
         self._run_simulation(self.baseline_model)
         observation = self._process_output(output)
@@ -250,3 +303,11 @@ class IrrigationEnv(gym.Env):
         weather_vars = ['IRRAD', 'TMIN', 'TMAX', 'VAP', 'RAIN']
         weather = [getattr(weatherdatacontainer, attr) for attr in weather_vars]
         return weather
+
+    def _construct_agro_manager(self):
+        """
+        For this model to be called there must not be any crops planted, and therefore no models
+        either. Therefore, we need to construct an agro-management calendar for managing the crop
+        rotations.
+        """
+

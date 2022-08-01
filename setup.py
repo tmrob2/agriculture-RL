@@ -9,6 +9,7 @@ setup(
         'pandas', 
         'PyYAML', 
         'stable-baselines3[extra]',
-        'tensorflow'
+        'tensorflow',
+        'numpy'
     ]
 )

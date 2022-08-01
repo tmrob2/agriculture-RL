@@ -1,6 +1,8 @@
 import tensorflow as tf
 from tensorflow import keras
 import numpy as np
+from typing import Tuple, List
+import gym
 
 CRITIC_LOSS_WEIGHT = 0.5
 ACTOR_LOSS_WEIGHT = 1.0
@@ -8,37 +10,7 @@ ENTROPY_LOSS_WEIGHT = 0.05
 BATCH_SIZE = 64
 GAMMA = 1.0
 
-def critic_loss(discounted_rewards, predicted_values):
-    return keras.losses.mean_squared_error(discounted_rewards, predicted_values) * \
-        CRITIC_LOSS_WEIGHT
-
-def actor_loss(combined, policy_logits):
-    actions = combined[:, 0] # Array with two columns (and BATCH_SIZE rows)
-    # The first column corresponds to the recorded actions of the agent as it traverses the 
-    # environment. The second column corresponds to the calculated advantages
-    advantages = combined[:, 1]
-    # sparse categorical cross-entropy function specifies that the input of the function is
-    # logits and iot also specifies the reduction to apply to the BATCH_SIZE number of 
-    # calculated losses. In this case a sum function, this is the summation in
-    #           J(\theta) ~ (\big_sum_{t=0}^{T-1}logP_{\pi_theta}(a_t | s_t)) A(s_t, a_t)
-    sparse_ce = keras.losses.SparseCategoricalCrossentropy(
-        from_logits=True,
-        reduction=tf.keras.losses.Reduction.SUM
-    )
-    # The actions are cast into tensorflow big integers
-    actions = tf.cast(actions, tf.int32)
-    # The policy loss is calculated based on the categorical cross-entory defined above
-    # Selects those policy probabilities that correspond to the action actually taken
-    # in the environment, and weights them by the advantage values
-    # By allpying sum reduction the loss formula will be implemented for this function
-    policy_loss = sparse_ce(actions, policy_logits, sample_weight=advantages)
-    # the actual probabilities for the action are estimated by applying the softmax function 
-    # to the logits
-    probs = tf.nn.softmax(policy_logits)
-    # The entropy loss is computed be applying the categorical cross-entropy function
-    entropy_loss = keras.losses.categorical_crossentropy(probs, probs)
-    return policy_loss * ACTOR_LOSS_WEIGHT - \
-        entropy_loss * ENTROPY_LOSS_WEIGHT
+huber_loss = tf.keras.losses.Huber(reduction=tf.keras.losses.Reduction.SUM)
 
 def advantages(rewards, dones, values, next_value):
     """
@@ -50,15 +22,43 @@ def advantages(rewards, dones, values, next_value):
     of the last state recorded in the list
     """
     # create a numpy array of the list of rweards, with the bootstrapped next_value appended to it
-    discounted_rewards = np.array(rewards + [next_value[0]])
+    rewards_new = rewards[::-1]
+    returns = tf.TensorArray(dtype=tf.float32, size=BATCH_SIZE)
+    discounted_sum = next_value
+    discounted_sum_shape = discounted_sum.shape
+    type_specific_dones = tf.cast(dones, tf.float32)[::-1]
     # proceeding backwards
-    for t in reversed(range(len(rewards))):
+    for t in tf.range(1, BATCH_SIZE):
         # compute the dicounted rewards and mask by whether the episode is done or not
-        discounted_rewards[t] = rewards[t] + GAMMA * discounted_rewards[t + 1] * (1- dones[t])
-    discounted_rewards = discounted_rewards[:-1]
+        reward = rewards[t]
+        discounted_sum = (reward + GAMMA * discounted_sum) * (1. - type_specific_dones[t])
+        discounted_sum.set_shape = discounted_sum_shape
+        returns = returns.write(t, discounted_sum)
+    returns = returns.stack()[::-1]
     # compute the advantages
-    advantages = discounted_rewards - np.stack(values)[:, 0]
-    return discounted_rewards, advantages
+    advs = returns - values
+    return returns, advs
+
+def compute_loss(action_probs: tf.Tensor, advantage: tf.Tensor, values, returns):
+    action_log_probs = tf.math.log(action_probs)
+    actor_loss = -tf.math.reduce_sum(action_log_probs * advantage)
+    critic_loss = huber_loss(values, returns)
+    return actor_loss + critic_loss
+
+class EnvMem:
+    def __init__(self, env: gym.Env):
+        self.env = env
+    def env_step(self, action: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        state, reward, done, _ = self.env.step(action)
+        return state.astype(np.float32), np.array(reward, np.float32), np.array(done, np.int32)
+
+    def tf_env_step(self, action: tf.Tensor) -> List[tf.Tensor]:
+        return tf.numpy_function(self.env_step, [action], [tf.float32, tf.float32, tf.int32])
+
+    def reset(self):
+        return self.env.reset()
+    def tf_reset(self):
+        return tf.numpy_function(self.reset, [], tf.float32)
 
 
 

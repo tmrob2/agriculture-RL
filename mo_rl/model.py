@@ -1,5 +1,6 @@
 import tensorflow as tf
 from tensorflow import keras
+import math
 
 class NNModel(keras.Model):
     """
@@ -20,13 +21,11 @@ class NNModel(keras.Model):
         self.num_actions = num_actions
         self.dense1 = keras.layers.Dense(
             64, 
-            activation='relu', 
-            kernel_initializer=keras.initializers.he_normal()
+            activation='tanh'
         )
         self.dense2 = keras.layers.Dense(
             64, 
-            activation='relu', 
-            kernel_initializer=keras.initializers.he_normal()
+            activation='tanh'
         )
         self.value = keras.layers.Dense(1)
         self.policy_logits = keras.layers.Dense(num_actions)
@@ -44,21 +43,4 @@ class NNModel(keras.Model):
         """
         x = self.dense1(inputs)
         x = self.dense2(x)
-        return self.value(x), self.policy_logits(x)
-    
-    def action_value(self, state):
-        """
-        Function is called with an action needs to be chosen from
-        the model. The first step in the function is to run
-        the predict_on_batch Keras API function. This function
-        runs the model.call function defined above. The output
-        is both the values and policy logits. An action is then
-        selected by randomly choosing an action based on the action
-        probabilities. 
-
-        tf.random.categorical takes an input of logits not softmax
-        outputs. 
-        """
-        value, logits = self.predict_on_batch(state)
-        action = tf.random.categorical(logits, 1)[0]
-        return action, value
+        return self.policy_logits(x), self.value(x)

@@ -8,70 +8,78 @@ import tensorflow as tf
 import numpy as np
 from tensorflow import keras
 
-def train(name, log, tboardpth, beta, nsteps, resume):
-    epsisode_reward_sum = 0
+optimizer = tf.keras.optimizers.Adam(learning_rate=0.0002)
+beta = 10.
+tboardpth = "logs/"
+nsteps = 100000
+env_id = 'Farming-v0'
+env_kwargs = dict(
+    soil_type="EC4",
+    fixed_date="2006-01-01",
+    fixed_location=(-33.385300, 148.007904),
+    intervention_interval=7, # is the farming period between interventions
+    beta=beta
+)
+train_writer = tf.summary.create_file_writer(tboardpth + f"/A2C-farm-gym-{dt.datetime.now().strftime('%d%m%Y%H%M')}")
+env = gym.make(env_id, **env_kwargs)
+env_ = alg.EnvMem(env)
+
+def train():
+    episode_reward_sum = 0.0
 
     # construct the environment either from memory or initialise
     # setup environment
-    env_kwargs = dict(
-        soil_type="EC4", 
-        fixed_date="2006-01-01", 
-        fixed_location=(-33.385300, 148.007904),
-        intervention_interval=7, # is the farming period between interventions
-        beta=beta
-    )
-
-    env_id = 'Farming-v0'
-    env = gym.make(env_id, **env_kwargs)
-
+    # loss = tf.constant(0.)
     model = NNModel(env.action_space.n)
-    model.compile(optimizer=keras.optimizers.Adam(), loss=[alg.critic_loss, alg.actor_loss])
-    train_writer = tf.summary.create_file_writer(tboardpth + f"/A2C-farm-gym-{dt.datetime.now().strftime('%d%m%Y%H%M')}")
-    state = env.reset()
+    state = tf.constant(env.reset(), dtype=tf.float32)
+    initial_state_shape = state.shape
     episode = 1
-
-    for step in range(nsteps):
-        rewards = []
-        actions = []
-        values = []
-        states = []
-        dones = []
-        for _ in range(alg.BATCH_SIZE):
-            _, policy_logits = model(state.reshape(1, -1))
-            action, value = model.action_value(state.reshape(1, -1))
-            new_state, reward, done, _info = env.step(action.numpy()[0])
-            actions.append(action)
-            values.append(value.numpy()[0])
-            states.append(state)
-            dones.append(done)
-            epsisode_reward_sum += reward
-            state = new_state
-            if done:
-                rewards.append(0.0)
-                state = env.reset()
-                print(f"Episode: {episode},latest episode reward: {epsisode_reward_sum}, loss: {loss}")
-                with train_writer.as_default():
-                    tf.summary.scalar('rewards', epsisode_reward_sum, episode)
-                    epsisode_reward_sum = 0
+    with tf.GradientTape(persistent=True) as tape:
+        for step in range(nsteps):
+            rewards = tf.TensorArray(dtype=tf.float32, size=alg.BATCH_SIZE)
+            values = tf.TensorArray(dtype=tf.float32, size=alg.BATCH_SIZE)
+            dones = tf.TensorArray(dtype=tf.int32, size=alg.BATCH_SIZE)
+            action_probs = tf.TensorArray(dtype=tf.float32, size=alg.BATCH_SIZE)
+            for k in tf.range(alg.BATCH_SIZE):
+                state = tf.expand_dims(state, 0)
+                policy_logits, value = model.call(state)
+                action = tf.random.categorical(policy_logits, 1)[0, 0]
+                action_probs_t = tf.nn.softmax(policy_logits, 1)
+                action_probs = action_probs.write(k, action_probs_t[0, action])
+                state, reward, done = env_.tf_env_step(action)
+                values = values.write(k, value)
+                dones = dones.write(k, done)
+                episode_reward_sum += reward
+                state.set_shape(initial_state_shape)
+                if tf.cast(done, tf.bool):
+                    rewards = rewards.write(k, 0.0)
+                    state = env_.tf_reset()
+                    state.set_shape(initial_state_shape)
+                    print(f"Episode: {episode},latest episode reward: {episode_reward_sum}, loss: {loss}")
+                    with train_writer.as_default():
+                        tf.summary.scalar('rewards', episode_reward_sum, episode)
+                    episode_reward_sum = 0.
                     episode += 1
-            else:
-                rewards.append(reward)
-        _, next_value = model.action_value(state.reshape(1, -1))
-        discounted_rewards, advs = alg.advantages(rewards, dones, values, next_value.numpy()[0])
+                else:
+                    rewards = rewards.write(k, reward)
+            state = tf.expand_dims(state, 0)
+            _, next_value = model.call(state)
+            next_value = tf.squeeze(next_value)
+            state = tf.squeeze(state)
+            rewards = rewards.stack()
+            values = values.stack()
+            dones = dones.stack()
+            action_probs = action_probs.stack()
+            values = tf.squeeze(values)
+            returns, advs = alg.advantages(rewards, dones, values, next_value)
+            loss = alg.compute_loss(action_probs, advs, values, returns)
+            grads = tape.gradient(loss, model.trainable_variables)
+            optimizer.apply_gradients(zip(grads, model.trainable_variables))
+            with train_writer.as_default():
+                tf.summary.scalar('tot_loss', loss, step)
+    del tape
 
-        # combine the actions and advantages into a comvbined array for passing
-        # actor_loss function
-        combined = np.zeros((len(actions), 2))
-        combined[:, 0] = actions
-        combined[:, 1] = advs
-
-        loss = model.train_on_batch(tf.stack(states), [discounted_rewards, combined])
-
-        with train_writer.as_default():
-            tf.summary.scalar('tot_loss', np.sum(loss), step)
-
-
-train("test", "model_logs/", "logs/", 10., 100000, False)
+train()
 
 #if __name__ == "__main__":
 #    parser = argparse.ArgumentParser()
