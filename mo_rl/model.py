@@ -16,7 +16,7 @@ class NNModel(keras.Model):
     softmax function which creates psuedo-probabilities P(s_t, a_t)
     can be applied within TensorFlow functions. 
     """
-    def __init__(self, num_actions):
+    def __init__(self, num_actions, num_tasks):
         super().__init__()
         self.num_actions = num_actions
         self.dense1 = keras.layers.Dense(
@@ -27,7 +27,7 @@ class NNModel(keras.Model):
             64, 
             activation='tanh'
         )
-        self.value = keras.layers.Dense(1)
+        self.value = keras.layers.Dense(1 + num_tasks)
         self.policy_logits = keras.layers.Dense(num_actions)
     
     def call(self, inputs):

@@ -1,7 +1,7 @@
 import argparse
 import gym
 import farm_gym
-from mo_rl import algorithm as alg
+from mo_rl import single_obj_algorithm as alg
 from mo_rl.model import NNModel
 import datetime as dt
 import tensorflow as tf
@@ -30,7 +30,7 @@ def train():
     # construct the environment either from memory or initialise
     # setup environment
     # loss = tf.constant(0.)
-    model = NNModel(env.action_space.n)
+    model = NNModel(env.action_space.n, 1)
     state = tf.constant(env.reset(), dtype=tf.float32)
     initial_state_shape = state.shape
     episode = 1

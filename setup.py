@@ -10,6 +10,7 @@ setup(
         'PyYAML', 
         'stable-baselines3[extra]',
         'tensorflow',
-        'numpy'
+        'numpy',
+        'tqdm'
     ]
 )
