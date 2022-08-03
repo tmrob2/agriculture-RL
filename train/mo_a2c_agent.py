@@ -13,27 +13,27 @@ import os
 import argparse
 
 
-optimizer = tf.keras.optimizers.Adam(learning_rate=0.0002)
+optimizer = tf.keras.optimizers.Adam(learning_rate=0.01)
 model_logs = "/home/tmrob2/PycharmProjects/farming-gym/model_logs/"
 tboardpth = "logs/"
 train_writer = tf.summary.create_file_writer(tboardpth + f"/A2C-farm-gym-{dt.datetime.now().strftime('%d%m%Y%H%M')}")
-beta = 10.
+beta = 100.
 tboardpth = "logs/"
 nsteps = 100000
 env_id = 'Farming-v0'
 NUM_AGENTS = 2
 NUM_TASKS = 2
 gamma = 1.0
-e = [12., 18.]
+e = [5., 7.]
 mu = 0.5
-c = 10.
-chi = 1.
-lam = .001
+c = 2000.
+chi = 0.
+lam = 1.
 
 def maize_quota(crops_planted, date):
     if date < datetime.datetime(2010, 1, 1).date():
         if crops_planted and 'maize' in crops_planted.keys():
-            if crops_planted['maize']['qty_tagp'] > 12:
+            if crops_planted['maize']['qty_tagp'] > 6:
                 return 1, 0.
             else:
                 return 0, crops_planted['maize']['delta']
@@ -45,7 +45,7 @@ def maize_quota(crops_planted, date):
 def wheat_quota(crops_planted, date):
     if date < datetime.datetime(2010, 1, 1).date():
         if crops_planted and 'wheat' in crops_planted.keys():
-            if crops_planted['wheat']['qty_tagp'] > 18:
+            if crops_planted['wheat']['qty_tagp'] > 10:
                 return 1, 0.
             else:
                 return 0, crops_planted['wheat']['delta']
@@ -87,16 +87,18 @@ farm1: gym.Env = gym.make(
     'Farming-v0',
     soil_type="EC4",
     start_date="2006-01-01",
-    end_date="2009-12-20",
-    fixed_location=(-33.385300, 148.007904)  # Forbes NSW
+    end_date="2007-12-20",
+    fixed_location=(-33.385300, 148.007904),  # Forbes NSW,
+    beta=beta
 )
 
 farm2: gym.Env = gym.make(
     'Farming-v0',
     soil_type="EC2",
     start_date="2006-01-01",
-    end_date="2009-12-20",
-    fixed_location=(-36.626230, 142.188370)  # Wimmera Victoria
+    end_date="2007-12-20",
+    fixed_location=(-36.626230, 142.188370),  # Wimmera Victoria
+    beta=beta
 )
 
 train_writer = tf.summary.create_file_writer(tboardpth + f"/A2C-farm-gym-{dt.datetime.now().strftime('%d%m%Y%H%M')}")
@@ -141,12 +143,14 @@ def train_step0(episode, models):
             # Calculating loss values to update out network
             ini_values_i = ini_values[i, :]
             loss = mo_alg.compute_loss(action_probs, values, returns, ini_values, ini_values_i, lam, chi, mu, e, c)
+            with train_writer.as_default():
+                tf.summary.scalar(f'agent_{i}_loss', loss, episode)
             loss_l.append(loss)
     # Compute the gradients from the loss vector
     vars_l = [m.trainable_variables for m in models]
     grads_l = tape.gradient(loss_l, vars_l)
 
-    # Apply the gradiesnts to the model params
+    # Apply the gradients to the model params
     grads_l_f = [x for y in grads_l for x in y]
     vars_l_f = [x for y in vars_l for x in y]
     optimizer.apply_gradients(zip(grads_l_f, vars_l_f))

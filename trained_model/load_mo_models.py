@@ -13,7 +13,7 @@ import tqdm
 import os
 
 
-optimizer = tf.keras.optimizers.Adam(learning_rate=0.02)
+optimizer = tf.keras.optimizers.Adam(learning_rate=0.09)
 model_logs = "model_logs/"
 tboardpth = "logs/"
 beta = 10.

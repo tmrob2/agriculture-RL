@@ -20,7 +20,7 @@ class NNModel(keras.Model):
         super().__init__()
         self.num_actions = num_actions
         self.dense1 = keras.layers.Dense(
-            64, 
+            128,
             activation='tanh'
         )
         self.dense2 = keras.layers.Dense(

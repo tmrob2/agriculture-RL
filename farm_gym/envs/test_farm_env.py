@@ -13,11 +13,14 @@ from pcse.util import WOFOST72SiteDataProvider
 #DATA_DIR = os.path.join(os.getcwd(), 'farm_gym/envs/env_data/')
 DATA_DIR = "/home/tmrob2/PycharmProjects/farming-gym/farm_gym/envs/env_data/"
 # Conversion constant kg / h -> kg / m ^ 2
-WEIGHT_CONVERSION = 10000
+WEIGHT_CONVERSION = 1000
+PENALTY = 1
+PLANTBONUS = 1
 
 class IrrigationEnv(gym.Env):
     """An environment for OpenAI gym to study crop irrigation"""
     metadata = {'render.modes': ['human']}
+    crop_planting_dict = {None: 0, 'wheat': 1, 'maize': 0}
 
     def __init__(
         self, 
@@ -32,7 +35,8 @@ class IrrigationEnv(gym.Env):
     ):
         self.action_space = gym.spaces.Discrete(9)
         # The observation space is 11 for the model output, and 7 (days) * 5 (weather metric observations / day)
-        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(11 + 7 * 5,), dtype=np.float32)
+        # + 1 State for whether something is planted { 0 - nothing, 1 - wheat, 2 - maize }
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(11 + 7 * 5 + 1,), dtype=np.float32)
 
         crop_params_dir = os.path.join(DATA_DIR, 'crop_params/')
         crop = YAMLCropDataProvider(crop_params_dir)
@@ -73,6 +77,7 @@ class IrrigationEnv(gym.Env):
             self.weatherdataprovider,
             self.baseline_agromanagement
         )
+        self.baseline_model._run
         self.log = self._init_log()
         self.training = training
 
@@ -111,31 +116,53 @@ class IrrigationEnv(gym.Env):
                  However, official evaluations of your agent are not allowed to
                  use this for learning.
         """
-        irrigation_amount = self._take_action(action)
+        irrigation_amount, apply_penalty, apply_bonus = self._take_action(action)
         baseline_date_diff = self.date - self.baseline_date
         output = self._run_simulation(self.model, baseline_date_diff)
         self.date = output.index[-1]
+
+        # define a maximum reward
         if self.date > self.baseline_date:
             baseline_output = self._run_simulation(self.baseline_model, self.date - self.baseline_date)
             self.baseline_date = baseline_output.index[-1]
             baseline_growth = baseline_output['TAGP'][-1] \
                               - baseline_output['TAGP'][-1 - self.intervention_interval]
+            #baseline_dvs = baseline_output['DVS'][-1] - baseline_output['DVS'][-1 - self.intervention_interval]
+            #baseline_dvs = baseline_dvs if not np.isnan(baseline_dvs) else 0
             baseline_growth = baseline_growth / WEIGHT_CONVERSION if not np.isnan(baseline_growth) else 0
             self.baseline_growth = baseline_growth
         try:
             growth = output['TAGP'][-1] / WEIGHT_CONVERSION - \
                      output['TAGP'][-1 - self.intervention_interval] / WEIGHT_CONVERSION
+            dvs = output['DVS'][-1] - output['DVS'][-1 - self.intervention_interval]
+
             if self.isplanted:
                 self.crop_planted[self.current_crop]['qty_tagp'] += growth
+                self.crop_planted[self.current_crop]['qty_tagp'] = round(self.crop_planted[self.current_crop]['qty_tagp'], 2)
                 self.crop_planted[self.current_crop]['delta'] = growth
+                self.crop_planted[self.current_crop]['delta'] = round(self.crop_planted[self.current_crop]['delta'], 2)
         except:
             growth = np.nan
+            dvs = np.nan
             if self.current_crop in self.crop_planted.keys():
-                self.crop_planted[self.current_crop]['detla'] = 0.
+                self.crop_planted[self.current_crop]['delta'] = 0.
+        # if a crop is planted then the farm should receive a reward
+        # if an illegal action is taken, like trying to replant on top of planted crops
+        # without harvesting then a penalty multiplier should be computed
+        #reward = 0.
+        growth = growth if not np.isnan(growth) else 0
 
-        growth = growth / WEIGHT_CONVERSION if not np.isnan(growth) else 0
-
-        reward = growth - self.baseline_growth - self.beta * irrigation_amount / 1000  # cm -> m
+        #if self.isplanted:
+        #    reward = PLANTBONUS
+        #reward += growth
+        #if apply_penalty:
+        #    reward *= PENALTY
+        #if reward - self.beta * irrigation_amount / 1000 > 0:
+        #reward -= self.beta * irrigation_amount / 1000
+        penalty = -PENALTY if apply_penalty else 0.
+        #dvs = dvs if not np.isnan(dvs) and self.isplanted else 0
+        #reward = dvs + growth - self.baseline_growth - self.beta * irrigation_amount / 1000 + penalty # cm -> m
+        reward = growth - self.beta * irrigation_amount / 1000 + penalty  # cm -> m
 
         observation = self._process_output(output)
         done = self.date >= self.sim_end_date
@@ -145,7 +172,10 @@ class IrrigationEnv(gym.Env):
             info = {**self.log}
         else:
             info = {**output.to_dict(), **self.log}
-        #print(f"action: {action}, agent date: {self.date}, baseline date: {self.baseline_date}, reward: {reward}, done: {done}, crops planted: {self.crop_planted}")
+        print(f"action: {action}, date: {self.date}, reward: {reward:.2f}, growth: {growth:.2f} "
+              f"irr pen: {self.beta * irrigation_amount / 1000} "
+              f"dvs: {dvs:.2f} "
+              f"crop: {self.current_crop}, zombie crop: {self.model.agromanager.ndays_in_crop_cycle >= 300}"), #crops planted: {self.crop_planted}")
         # print(self.crop_planted)
         return observation, reward, done, info
 
@@ -172,7 +202,7 @@ class IrrigationEnv(gym.Env):
         # weather until next intervention time
         weather_observation = self._get_weather(self.weatherdataprovider, self.date,
                                              self.intervention_interval)
-        observation = np.concatenate([crop_observation, weather_observation.flatten()], dtype=np.float32)
+        observation = np.concatenate([[1 if self.isplanted else 0.], crop_observation, weather_observation.flatten()], dtype=np.float32)
         observation = np.nan_to_num(observation)
         return observation
 
@@ -193,7 +223,7 @@ class IrrigationEnv(gym.Env):
             model.run(days=datediff.days)
         else:
             model.run(days=self.intervention_interval)
-        output = pd.DataFrame(model.get_output()).set_index("day")
+        output = pd.DataFrame(model.get_output())
         output = output.fillna(value=np.nan)
         return output
 
@@ -210,6 +240,10 @@ class IrrigationEnv(gym.Env):
 
         """
         amount = 0
+        apply_penalty = False
+        apply_bonus = False
+        if self.model.agromanager.ndays_in_crop_cycle >= 300:
+            action = 8
         if action == 1:
             # plant wheat
             # copy the current format
@@ -240,6 +274,9 @@ class IrrigationEnv(gym.Env):
                 else:
                     self.crop_planted['wheat'] = {'date': [self.date], 'qty_tagp': 0., 'delta': 0.}
                 self.isplanted = True
+                apply_bonus = True
+            else:
+                apply_penalty = True
         elif action == 2:
             # plant maize
             if not self.isplanted:
@@ -267,11 +304,17 @@ class IrrigationEnv(gym.Env):
                 else:
                     self.crop_planted['maize'] = {'date': [self.date], 'qty_tagp': 0., 'delta': 0.}
                 self.isplanted = True
+                apply_bonus = True
+            else:
+                apply_penalty = True
         elif action in list(range(3, 8)):
             # irrigate
-            irrigation_rate = (action - 2)
-            amount = irrigation_rate*self.amount # in cm
-            self.model._send_signal(signal=pcse.signals.irrigate, amount=amount, efficiency=0.7)
+            if self.isplanted:
+                irrigation_rate = (action - 2)
+                amount = irrigation_rate*self.amount # in cm
+                self.model._send_signal(signal=pcse.signals.irrigate, amount=amount, efficiency=0.7)
+            else:
+                apply_penalty = True
         elif action == 8:
             # harvest
             if self.isplanted:
@@ -297,7 +340,31 @@ class IrrigationEnv(gym.Env):
                 )
                 self.current_crop = None
                 self.isplanted = False
-        return amount
+            elif not self.isplanted and self.model.agromanager.ndays_in_crop_cycle >= 300:
+                # handle an error with progressing the model with action ending up in a crop rotation
+                _dict = self.agromanagement['AgroManagement'][0]
+                for _k, v in _dict.items():
+                    v['CropCalendar'] = {
+                        'crop_name': 'maize',
+                        'variety_name': "Maize_VanHeemst_1988",
+                        'crop_start_date': self.date + datetime.timedelta(days=180)
+                        if self.date + datetime.timedelta(days=180) < self.sim_end_date
+                        else self.sim_end_date - datetime.timedelta(days=1),
+                        'crop_start_type': 'sowing',
+                        'crop_end_date': self.sim_end_date,
+                        'crop_end_type': 'earliest',
+                        'max_duration': 300
+                    }
+                    self.agromanagement['AgroManagement'].append({self.date: v})
+                self.agromanagement['AgroManagement'].pop(0)
+                self.model = pcse.models.Wofost72_WLP_FD(
+                    self.parameterprovider,
+                    self.weatherdataprovider,
+                    self.agromanagement
+                )
+            else:
+                apply_penalty = True
+        return amount, apply_penalty, apply_bonus
 
     def reset(self):
         """
@@ -369,4 +436,25 @@ class IrrigationEnv(gym.Env):
         weather_vars = ['IRRAD', 'TMIN', 'TMAX', 'VAP', 'RAIN']
         weather = [getattr(weatherdatacontainer, attr) for attr in weather_vars]
         return weather
+
+    def run_baseline_to_terminate(self):
+        self.baseline_model.run_till_terminate()
+        output = pd.DataFrame(self.baseline_model.get_output()).set_index("day")
+        return output
+    def crop_cycle_delta(self, output: pd.DataFrame):
+        """
+        Go through each crop cycle in the agromanager, if then map the current date in the
+        """
+        new_output = output.apply(self._apply_crop_days)
+        new_output.set_index('date')
+
+
+    def _apply_crop_days(self, data_row):
+        for cropcal in self.baseline_model.agromanager.crop_calendars:
+            start_date = cropcal.crop_start_date
+            end_date = cropcal
+            if start_date < data_row['date'] < end_date:
+                return (start_date - end_date).days
+        return np.nan
+
 

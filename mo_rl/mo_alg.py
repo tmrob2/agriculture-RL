@@ -102,7 +102,7 @@ class EnvMem:
             rewards = rewards.write(t, reward)
 
             if tf.cast(done, tf.bool):
-                print(f"agent {agent} ran for {t} step")
+                # print(f"agent {agent} ran for {t} step")
                 break
         action_probs = action_probs.stack()
         values = values.stack()
@@ -161,11 +161,13 @@ def compute_loss(
     c
 ) -> tf.Tensor:
     """Computes the combined actor-critic loss."""
+    print("init value ", ini_values_i)
     H = computeH(ini_value, ini_values_i, lam, chi, mu, e, c)
     advantage = tf.matmul(returns - values, H)
     action_log_probs = tf.math.log(action_probs)
     actor_loss = tf.math.reduce_sum(action_log_probs * advantage)
     critic_loss = huber_loss(values, returns)
+    print(f"actor loss: {actor_loss}, critic loss: {critic_loss}, loss: {actor_loss + critic_loss}")
     return actor_loss + critic_loss
 
 
