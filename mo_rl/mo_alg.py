@@ -1,3 +1,4 @@
+import keras.losses
 import numpy as np
 from typing import List, Tuple
 import gym
@@ -6,6 +7,7 @@ from mo_rl.dfa import DFA
 import copy
 
 huber_loss = tf.keras.losses.Huber(reduction=tf.keras.losses.Reduction.SUM)
+ENTROPY_COEF = 1
 
 class EnvMem:
     def __init__(self, envs: List[gym.Env], tasks,):
@@ -167,7 +169,8 @@ def compute_loss(
     action_log_probs = tf.math.log(action_probs)
     actor_loss = tf.math.reduce_sum(action_log_probs * advantage)
     critic_loss = huber_loss(values, returns)
-    print(f"actor loss: {actor_loss}, critic loss: {critic_loss}, loss: {actor_loss + critic_loss}")
-    return actor_loss + critic_loss
+    print(f"actor loss: {actor_loss}, critic loss: {critic_loss * 1000}, loss: {actor_loss + critic_loss * 1000}")
+    entropy = ENTROPY_COEF * keras.losses.categorical_crossentropy(tf.squeeze(action_probs), tf.squeeze(action_probs))
+    return actor_loss + 1000 * critic_loss - entropy
 
 

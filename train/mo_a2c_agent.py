@@ -13,7 +13,7 @@ import os
 import argparse
 
 
-optimizer = tf.keras.optimizers.Adam(learning_rate=0.01)
+optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
 model_logs = "/home/tmrob2/PycharmProjects/farming-gym/model_logs/"
 tboardpth = "logs/"
 train_writer = tf.summary.create_file_writer(tboardpth + f"/A2C-farm-gym-{dt.datetime.now().strftime('%d%m%Y%H%M')}")
@@ -26,7 +26,7 @@ NUM_TASKS = 2
 gamma = 1.0
 e = [5., 7.]
 mu = 0.5
-c = 2000.
+c = 90. * 5  # two production cycles of full crops
 chi = 0.
 lam = 1.
 
@@ -182,7 +182,7 @@ if __name__ == '__main__':
         models = [NNModel(n, NUM_TASKS) for _ in range(NUM_AGENTS)]
 
     running_reward = 0.
-    threshold = 17.
+    threshold = 900.
 
     ## No discount
     # Discount factor for future rewards

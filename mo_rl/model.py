@@ -20,11 +20,11 @@ class NNModel(keras.Model):
         super().__init__()
         self.num_actions = num_actions
         self.dense1 = keras.layers.Dense(
-            128,
+            64,
             activation='tanh'
         )
         self.dense2 = keras.layers.Dense(
-            64, 
+            64,
             activation='tanh'
         )
         self.value = keras.layers.Dense(1 + num_tasks)
@@ -42,5 +42,5 @@ class NNModel(keras.Model):
         rerturns first the value output then the policy logits
         """
         x = self.dense1(inputs)
-        x = self.dense2(x)
+        #x = self.dense2(x)
         return self.policy_logits(x), self.value(x)

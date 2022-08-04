@@ -36,7 +36,10 @@ class IrrigationEnv(gym.Env):
         self.action_space = gym.spaces.Discrete(9)
         # The observation space is 11 for the model output, and 7 (days) * 5 (weather metric observations / day)
         # + 1 State for whether something is planted { 0 - nothing, 1 - wheat, 2 - maize }
-        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(11 + 7 * 5 + 1,), dtype=np.float32)
+        # + 1 state for the crop age
+        # + 1 state for crop maturity
+        # + 1 state for fallow flag
+        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(11 + 7 * 5 + 4,), dtype=np.float32)
 
         crop_params_dir = os.path.join(DATA_DIR, 'crop_params/')
         crop = YAMLCropDataProvider(crop_params_dir)
@@ -59,25 +62,36 @@ class IrrigationEnv(gym.Env):
         self.agromanagement = self._load_agromanagement_data()
         # Input the baseline agromanagement
         agro_dir = os.path.join(DATA_DIR, "agro/")
-        agromanagement_file = os.path.join(agro_dir, 'baseline_4yr_model.yaml')
-        self.baseline_agromanagement = YAMLAgroManagementReader(agromanagement_file)
+        wheat_agromanagement_file = os.path.join(agro_dir, 'wofost_baseline_maize.yaml')
+        maize_agromanagement_file = os.path.join(agro_dir, 'wofost_baseline_wheat.yaml')
+        self.wheat_baseline_agromanagement = YAMLAgroManagementReader(wheat_agromanagement_file)
+        self.maize_baseline_agromanagement = YAMLAgroManagementReader(maize_agromanagement_file)
         self.date = self.sim_start_date
-        self.baseline_date = self.sim_start_date
         self.current_crop = None
         self.isplanted = False
-        self.baseline_growth = 0.
+        self.fallow = False
+        self.fallow_time = 0
+        self.fallow_start_days = 0
         self.crop_planted = {}
         self.model = pcse.models.Wofost72_WLP_FD(
             self.parameterprovider,
             self.weatherdataprovider,
             self.agromanagement
         )
-        self.baseline_model = pcse.models.Wofost72_WLP_FD(
+        self.wheat_baseline_model = pcse.models.Wofost72_WLP_FD(
             self.parameterprovider,
             self.weatherdataprovider,
-            self.baseline_agromanagement
+            self.wheat_baseline_agromanagement
         )
-        self.baseline_model._run
+        self.maize_baseline_model = pcse.models.Wofost72_WLP_FD(
+            self.parameterprovider,
+            self.weatherdataprovider,
+            self.wheat_baseline_agromanagement
+        )
+        self.baseline_wheat_output = self.run_baseline_to_terminate(self.wheat_baseline_model)
+        self.baseline_maize_output = self.run_baseline_to_terminate(self.maize_baseline_model)
+        self.crop_cycle_delta(self.baseline_maize_output, self.maize_baseline_model)
+        self.crop_cycle_delta(self.baseline_wheat_output, self.wheat_baseline_model)
         self.log = self._init_log()
         self.training = training
 
@@ -116,25 +130,13 @@ class IrrigationEnv(gym.Env):
                  However, official evaluations of your agent are not allowed to
                  use this for learning.
         """
-        irrigation_amount, apply_penalty, apply_bonus = self._take_action(action)
-        baseline_date_diff = self.date - self.baseline_date
-        output = self._run_simulation(self.model, baseline_date_diff)
+        irrigation_amount, apply_penalty, action_applied = self._take_action(action)
+        output = self._run_simulation(self.model)
         self.date = output.index[-1]
-
-        # define a maximum reward
-        if self.date > self.baseline_date:
-            baseline_output = self._run_simulation(self.baseline_model, self.date - self.baseline_date)
-            self.baseline_date = baseline_output.index[-1]
-            baseline_growth = baseline_output['TAGP'][-1] \
-                              - baseline_output['TAGP'][-1 - self.intervention_interval]
-            #baseline_dvs = baseline_output['DVS'][-1] - baseline_output['DVS'][-1 - self.intervention_interval]
-            #baseline_dvs = baseline_dvs if not np.isnan(baseline_dvs) else 0
-            baseline_growth = baseline_growth / WEIGHT_CONVERSION if not np.isnan(baseline_growth) else 0
-            self.baseline_growth = baseline_growth
+        soil_moisture = output['SM'][-1]
         try:
             growth = output['TAGP'][-1] / WEIGHT_CONVERSION - \
                      output['TAGP'][-1 - self.intervention_interval] / WEIGHT_CONVERSION
-            dvs = output['DVS'][-1] - output['DVS'][-1 - self.intervention_interval]
 
             if self.isplanted:
                 self.crop_planted[self.current_crop]['qty_tagp'] += growth
@@ -143,41 +145,57 @@ class IrrigationEnv(gym.Env):
                 self.crop_planted[self.current_crop]['delta'] = round(self.crop_planted[self.current_crop]['delta'], 2)
         except:
             growth = np.nan
-            dvs = np.nan
             if self.current_crop in self.crop_planted.keys():
                 self.crop_planted[self.current_crop]['delta'] = 0.
-        # if a crop is planted then the farm should receive a reward
-        # if an illegal action is taken, like trying to replant on top of planted crops
-        # without harvesting then a penalty multiplier should be computed
-        #reward = 0.
-        growth = growth if not np.isnan(growth) else 0
 
-        #if self.isplanted:
-        #    reward = PLANTBONUS
-        #reward += growth
-        #if apply_penalty:
-        #    reward *= PENALTY
-        #if reward - self.beta * irrigation_amount / 1000 > 0:
-        #reward -= self.beta * irrigation_amount / 1000
-        penalty = -PENALTY if apply_penalty else 0.
-        #dvs = dvs if not np.isnan(dvs) and self.isplanted else 0
-        #reward = dvs + growth - self.baseline_growth - self.beta * irrigation_amount / 1000 + penalty # cm -> m
-        reward = growth - self.beta * irrigation_amount / 1000 + penalty  # cm -> m
+        # get the baseline growth
+        cycle_days = self.model.agromanager.ndays_in_crop_cycle
+        baseline_growth = self.get_expected_baseline_growth(cycle_days)
+        baseline_growth = baseline_growth / WEIGHT_CONVERSION if not np.isnan(baseline_growth) else 0.0
+
+        base_reward = 3. if self.isplanted else 0.
+        growth = growth if not np.isnan(growth) else 0
+        #if baseline_growth > 0.:
+        base_reward += growth - baseline_growth
+        if soil_moisture <= 0.2 and self.isplanted:
+            base_reward += self.beta * irrigation_amount / 1000
+        else:
+            base_reward -= self.beta * irrigation_amount / 1000
+        #if not apply_penalty and action == 0 and not self.isplanted:
+        #    base_reward = 0.5
+        # crop harvest and soil management
+        if self.isplanted and self._get_crop_maturity(output['DVS'][-1]) == 2:
+            if action == 8:
+                base_reward = 5.
+            else:
+                base_reward -= 2.
+        if apply_penalty:
+            base_reward = -1.
+
+        if self.fallow:
+            self.compute_fallow_days()
+            self._fallow_period()
+            if action != 0 and self.fallow_time < 180:
+                base_reward = -1
+            elif action == 0 and self.fallow_time < 180:
+                base_reward = 3.
 
         observation = self._process_output(output)
         done = self.date >= self.sim_end_date
 
-        self._log(growth, self.baseline_growth, irrigation_amount, reward, self.crop_planted)
+        self._log(growth, baseline_growth, irrigation_amount, base_reward, self.crop_planted)
         if self.training:
             info = {**self.log}
         else:
             info = {**output.to_dict(), **self.log}
-        print(f"action: {action}, date: {self.date}, reward: {reward:.2f}, growth: {growth:.2f} "
-              f"irr pen: {self.beta * irrigation_amount / 1000} "
-              f"dvs: {dvs:.2f} "
-              f"crop: {self.current_crop}, zombie crop: {self.model.agromanager.ndays_in_crop_cycle >= 300}"), #crops planted: {self.crop_planted}")
+        print(f"action: {action}, date: {self.date}, reward: {base_reward:.2f}, "
+              f"grw: {growth:.2f} b grw: {baseline_growth:.2f} "
+              f"fallow: {self.fallow}, fallow days: {self.fallow_time} "
+              f"moist: {soil_moisture:.2f} "
+              f"irr: {self.beta * irrigation_amount / 1000} "
+              f"crop: {self.current_crop}, crop cycle: {self.model.agromanager.ndays_in_crop_cycle}"), #crops planted: {self.crop_planted}")
         # print(self.crop_planted)
-        return observation, reward, done, info
+        return observation, base_reward, done, info
 
     @staticmethod
     def _init_log():
@@ -202,10 +220,41 @@ class IrrigationEnv(gym.Env):
         # weather until next intervention time
         weather_observation = self._get_weather(self.weatherdataprovider, self.date,
                                              self.intervention_interval)
-        observation = np.concatenate([[1 if self.isplanted else 0.], crop_observation, weather_observation.flatten()], dtype=np.float32)
+        crop_maturity = self._get_crop_maturity(output['DVS'][-1])
+        add_on_states = [
+            1. if self.isplanted else 0.,
+            self.model.agromanager.ndays_in_crop_cycle,
+            crop_maturity,
+            1. if self.fallow else 0.
+        ]
+        observation = np.concatenate([add_on_states,
+                                      crop_observation,
+                                      weather_observation.flatten()], dtype=np.float32)
         observation = np.nan_to_num(observation)
         return observation
 
+    def _fallow_period(self):
+        if self.fallow_time > 180:
+            self.fallow = False
+            self.fallow_time = 0
+            self.fallow_start_days = 0
+        else:
+            self.fallow = True
+
+    @property
+    def get_current_days(self):
+        return self.model.timer.day_counter
+
+    def compute_fallow_days(self):
+        self.fallow_time += (self.get_current_days - self.fallow_start_days)
+
+    def _get_crop_maturity(self, dvs):
+        if dvs < 0.5:
+            return 0
+        elif 0.5 <= dvs < 1.5:
+            return 1
+        else:
+            return 2
     def _get_weatherdataprovider(self):
         location = self.fixed_location
         return pcse.db.NASAPowerWeatherDataProvider(*location)
@@ -218,12 +267,9 @@ class IrrigationEnv(gym.Env):
         train_weather_data = [year for year in all_years if year not in missing_data + test_years]
         return train_weather_data
 
-    def _run_simulation(self, model, datediff: datetime.timedelta):
-        if datediff.days > self.intervention_interval:
-            model.run(days=datediff.days)
-        else:
-            model.run(days=self.intervention_interval)
-        output = pd.DataFrame(model.get_output())
+    def _run_simulation(self, model):
+        model.run(days=self.intervention_interval)
+        output = pd.DataFrame(model.get_output()).set_index('day')
         output = output.fillna(value=np.nan)
         return output
 
@@ -241,7 +287,6 @@ class IrrigationEnv(gym.Env):
         """
         amount = 0
         apply_penalty = False
-        apply_bonus = False
         if self.model.agromanager.ndays_in_crop_cycle >= 300:
             action = 8
         if action == 1:
@@ -274,7 +319,6 @@ class IrrigationEnv(gym.Env):
                 else:
                     self.crop_planted['wheat'] = {'date': [self.date], 'qty_tagp': 0., 'delta': 0.}
                 self.isplanted = True
-                apply_bonus = True
             else:
                 apply_penalty = True
         elif action == 2:
@@ -304,7 +348,6 @@ class IrrigationEnv(gym.Env):
                 else:
                     self.crop_planted['maize'] = {'date': [self.date], 'qty_tagp': 0., 'delta': 0.}
                 self.isplanted = True
-                apply_bonus = True
             else:
                 apply_penalty = True
         elif action in list(range(3, 8)):
@@ -323,9 +366,7 @@ class IrrigationEnv(gym.Env):
                     v['CropCalendar'] = {
                         'crop_name': 'maize',
                         'variety_name': "Maize_VanHeemst_1988",
-                        'crop_start_date': self.date + datetime.timedelta(days=180)
-                            if self.date + datetime.timedelta(days=180) < self.sim_end_date
-                            else self.sim_end_date - datetime.timedelta(days=1),
+                        'crop_start_date': self.sim_end_date - datetime.timedelta(days=1),
                         'crop_start_type': 'sowing',
                         'crop_end_date': self.sim_end_date,
                         'crop_end_type': 'earliest',
@@ -338,18 +379,18 @@ class IrrigationEnv(gym.Env):
                     self.weatherdataprovider,
                     self.agromanagement
                 )
+                self.fallow = True
+                self.fallow_start_days = self.model.timer.day_counter
                 self.current_crop = None
                 self.isplanted = False
-            elif not self.isplanted and self.model.agromanager.ndays_in_crop_cycle >= 300:
+            elif not self.isplanted and self.model.agromanager.ndays_in_crop_cycle >= 7:
                 # handle an error with progressing the model with action ending up in a crop rotation
                 _dict = self.agromanagement['AgroManagement'][0]
                 for _k, v in _dict.items():
                     v['CropCalendar'] = {
                         'crop_name': 'maize',
                         'variety_name': "Maize_VanHeemst_1988",
-                        'crop_start_date': self.date + datetime.timedelta(days=180)
-                        if self.date + datetime.timedelta(days=180) < self.sim_end_date
-                        else self.sim_end_date - datetime.timedelta(days=1),
+                        'crop_start_date': self.sim_end_date - datetime.timedelta(days=1),
                         'crop_start_type': 'sowing',
                         'crop_end_date': self.sim_end_date,
                         'crop_end_type': 'earliest',
@@ -362,9 +403,12 @@ class IrrigationEnv(gym.Env):
                     self.weatherdataprovider,
                     self.agromanagement
                 )
+                self.fallow = True
+                self.current_crop = None
+                self.isplanted = False
             else:
                 apply_penalty = True
-        return amount, apply_penalty, apply_bonus
+        return amount, apply_penalty, action
 
     def reset(self):
         """
@@ -374,17 +418,15 @@ class IrrigationEnv(gym.Env):
         self.weatherdataprovider = self._get_weatherdataprovider()
         self.date = self.sim_start_date
         self.agromanagement = self._load_agromanagement_data()
-        self.baseline_date = self.sim_start_date
         self.current_crop = None
         self.isplanted = False
-        self.baseline_growth = 0.
+        self.fallow = False
+        self.fallow_time = 0
+        self.fallow_start_days = 0
         self.crop_planted = {}
         self.model = pcse.models.Wofost72_WLP_FD(self.parameterprovider, self.weatherdataprovider,
                                          self.agromanagement)
-        self.baseline_model = pcse.models.Wofost72_WLP_FD(self.parameterprovider, self.weatherdataprovider,
-                                                  self.baseline_agromanagement)
-        output = self._run_simulation(self.model, datetime.timedelta(0, 0, 0))
-        self._run_simulation(self.baseline_model, datetime.timedelta(0, 0, 0))
+        output = self._run_simulation(self.model)
         observation = self._process_output(output)
         return observation
 
@@ -437,24 +479,71 @@ class IrrigationEnv(gym.Env):
         weather = [getattr(weatherdatacontainer, attr) for attr in weather_vars]
         return weather
 
-    def run_baseline_to_terminate(self):
-        self.baseline_model.run_till_terminate()
-        output = pd.DataFrame(self.baseline_model.get_output()).set_index("day")
+    def run_baseline_to_terminate(self, baseline_model):
+        baseline_model.run_till_terminate()
+        output = pd.DataFrame(baseline_model.get_output())
         return output
-    def crop_cycle_delta(self, output: pd.DataFrame):
+    def crop_cycle_delta(self, output: pd.DataFrame, baseline_model):
         """
         Go through each crop cycle in the agromanager, if then map the current date in the
         """
-        new_output = output.apply(self._apply_crop_days)
-        new_output.set_index('date')
+        crop_cycle_days = output['day'].apply(self._apply_crop_days, args=(baseline_model.agromanager.crop_calendars,))
+        output.set_index('day')
+        output["crop_days"] = crop_cycle_days
+        return output
 
 
-    def _apply_crop_days(self, data_row):
-        for cropcal in self.baseline_model.agromanager.crop_calendars:
+    def _apply_crop_days(self, date, crop_calendar):
+        for cropcal in crop_calendar:
             start_date = cropcal.crop_start_date
-            end_date = cropcal
-            if start_date < data_row['date'] < end_date:
-                return (start_date - end_date).days
+            end_date = cropcal.crop_end_date
+            if start_date <= date < end_date:
+                return (date - start_date).days
+        return np.nan
+
+    def get_expected_baseline_growth(self, production_days):
+        if self.current_crop == "maize":
+            max_maize_product_days = self.baseline_maize_output.iloc[-1]['crop_days']
+            if production_days > max_maize_product_days:
+                current = \
+                    self.baseline_maize_output.iloc[-1]['TAGP']
+                previous_cycle = \
+                    self.baseline_maize_output.iloc[-2]['TAGP']
+                baseline_growth = current - previous_cycle
+            elif production_days - self.intervention_interval < 0:
+                current = \
+                    self.baseline_maize_output[self.baseline_maize_output.crop_days == 0]['TAGP'].values[0]
+                previous_cycle = \
+                    self.baseline_maize_output[self.baseline_maize_output.crop_days == 0]['TAGP'].values[0]
+                baseline_growth = current - previous_cycle
+            else:
+                current = \
+                    self.baseline_maize_output[self.baseline_maize_output.crop_days == production_days]['TAGP'].values[0]
+                previous_cycle = \
+                    self.baseline_maize_output[self.baseline_maize_output.crop_days == production_days - self.intervention_interval]['TAGP'].values[0]
+                baseline_growth = current - previous_cycle
+            return baseline_growth
+        elif self.current_crop == "wheat":
+            max_wheat_product_days = self.baseline_wheat_output.iloc[-1]['crop_days']
+            if production_days > max_wheat_product_days:
+                current = \
+                    self.baseline_maize_output.iloc[-1]['TAGP']
+                previous_cycle = \
+                    self.baseline_maize_output.iloc[-2]['TAGP']
+                baseline_growth = current - previous_cycle
+            elif production_days - self.intervention_interval < 0:
+                current = \
+                    self.baseline_wheat_output[self.baseline_wheat_output.crop_days == 0]['TAGP'].values[0]
+                previous_cycle = \
+                    self.baseline_wheat_output[self.baseline_wheat_output.crop_days == 0]['TAGP'].values[0]
+                baseline_growth = current - previous_cycle
+            else:
+                current = \
+                    self.baseline_wheat_output[self.baseline_wheat_output.crop_days == production_days]['TAGP'].values[0]
+                previous_cycle = \
+                    self.baseline_wheat_output[self.baseline_wheat_output.crop_days == production_days - self.intervention_interval]['TAGP'].values[0]
+                baseline_growth = current - previous_cycle
+            return baseline_growth
         return np.nan
 
 
